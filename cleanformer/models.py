@@ -2,6 +2,8 @@ import torch.nn
 from pytorch_lightning import LightningModule
 from torch.nn import functional as F
 
+from cleanformer.tensors import subsequent_mask
+
 
 class Transformer(LightningModule):
     def __init__(self, hidden_size: int, ffn_size: int,
@@ -16,8 +18,8 @@ class Transformer(LightningModule):
         # 학습을 해야하는 레이어 => 임베딩 테이블, 인코더, 디코더 를 학습한다!
         self.token_embeddings = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_size)
         self.layer = torch.nn.Module()
-        self.encoder = Encoder(hidden_size, heads)
-        self.decoder = Decoder
+        self.encoder = Encoder(hidden_size, heads, max_length)
+        self.decoder = Decoder(hidden_size, heads, max_length)
 
     def forward(self, src_ids: torch.LongTensor, tgt_ids: torch.Tensor,
                 src_key_padding_mask: torch.Tensor,tgt_key_padding_mask: torch.Tensor) -> torch.Tensor:
@@ -26,7 +28,7 @@ class Transformer(LightningModule):
         """
         src_ids : (N,L)
         tgt_ids : (N,L)
-        """
+/Users/hong-in-yeong/WEB/hiy-django/costaurant/foods/templates/account/messages/password_changed.txt        """
         # 불러오기
         src = self.token_embeddings(src_ids) # (N,L) -> (N,L,H)
         tgt = self.token_embeddings(tgt_ids) # (N,L) -> (N,L,H)
@@ -101,38 +103,58 @@ class Transformer(LightningModule):
 
 class Encoder(torch.nn.Module):
 
-    def __init__(self, hidden_size: int, heads: int):
+    def __init__(self, hidden_size: int, heads: int, max_length: int):
         super().__init__()
 
-        self.self_attention_layer = MultiHeadAttentionLayer(hidden_size, heads)
+        self.multi_head_self_attention_layer = MultiHeadAttentionLayer(hidden_size, heads, max_length, masked=False)
 
         #TODO - ffn
 
     def forward(self, x:torch.Tensor):
 
 
-        contexts = self.self_attention_layer.forward(q=x, k=x, v=x) # 단어가 쓰인 문장에서 단어가 가지는 의미를 임베딩 벡터에 인코딩해준다
+        contexts = self.multi_head_self_attention_layer.forward(q=x, k=x, v=x) # 단어가 쓰인 문장에서 단어가 가지는 의미를 임베딩 벡터에 인코딩해준다
         # 맥락이반영된 벡터
         return contexts
 
 
 class Decoder(torch.nn.Module):
 
-    pass
+    def __init__(self, hidden_size: int, heads: int, max_length: int):
+        super().__init__()
+        self.masked_multi_head_self_attention_layer = MultiHeadAttentionLayer(hidden_size, heads, max_length, masked=True)
+
+    def forward(self, x:torch.Tensor, memory: torch.Tensor ):
+        """
+
+        memory: (N, L, H) - 인코더의 출력 ( 한국어 문장에 대한 기억)
+
+        """
+
+        contexts = self.masked_multi_head_self_attention_layer.forward(q=x, k=x, v=x)
+        return contexts
+    # TODO : ffn, residual connection
 
 class MultiHeadAttentionLayer(torch.nn.Module):
 
-    def __init__(self, hidden_size: int, heads: int):
+    def __init__(self, hidden_size: int, heads: int, max_length: int, masked: bool):
         super().__init__()
         self.hidden_size = hidden_size
         self.heads = heads # 머리가 몇개?    symbol: h
+        self.masked = masked
+
         assert self.hidden_size % self.heads == 0 # 조건생성 : 나머지가 생기지 않는 조건으로 설정
         self.head_size = self.hidden_size // self.heads   # symbol:s
+        self.max_length = max_length
 
         self.linear_q = torch.nn.Linear(hidden_size,hidden_size)
         self.linear_k = torch.nn.Linear(hidden_size,hidden_size)
         self.linear_v = torch.nn.Linear(hidden_size,hidden_size)
         self.linear_o = torch.nn.Linear(hidden_size,hidden_size)
+
+        # 상수 텐서를 register_buffer ; 아래에 마스킹을 할때 텐서를 직접 생성하게 되면 연산이 느리고, cuda error가 발생.
+        self.register_buffer("subsequent_mask", subsequent_mask(max_length))
+
 
     def forward(self, q:torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 
@@ -143,16 +165,16 @@ class MultiHeadAttentionLayer(torch.nn.Module):
         return => (N,L,H)
 
         """
-        N, L, _ = q.size()
+        N, _, _ = q.size()
         q = self.linear_q(q) # (N, L, H) * (H, H) -> (N, L, H)
         k = self.linear_k(k) # (N, L, H) * (H, H) -> (N, L, H)
         v = self.linear_v(v) # (N, L, H) * (H, H) -> (N, L, H)
 
         # Multihead 만들기 : concat이 아닌, reshape을 통해서 머리를 나눠주는 방식으로 만들어줘야한다.
 
-        q = q.reshape(N,L, self.heads, self.head_size)    # (N, L, H) -> (N, L, heads, H //heads)
-        k = k.reshape(N,L, self.heads, self.head_size)    # (N, L, H) -> (N, L, heads, H //heads)
-        v = v.reshape(N,L, self.heads, self.head_size)    # (N, L, H) -> (N, L, heads, H //heads)
+        q = q.reshape(N,self.max_length, self.heads, self.head_size)    # (N, L, H) -> (N, L, heads, H //heads)
+        k = k.reshape(N,self.max_length, self.heads, self.head_size)    # (N, L, H) -> (N, L, heads, H //heads)
+        v = v.reshape(N,self.max_length, self.heads, self.head_size)    # (N, L, H) -> (N, L, heads, H //heads)
 
 
 
@@ -166,6 +188,24 @@ class MultiHeadAttentionLayer(torch.nn.Module):
 
 
         # TODO - masking(auto-regressive)
+
+        if self.masked:
+            """
+            subsequent masking 이 되지않은 부분에 -inf
+            masked_fill
+            """
+
+            # ( L, L) -> (1, 1, L, L) -> (N, heads, L, L)
+            mask = self.subsequent_mask.reshape(1, 1, self.max_length, self.max_length)
+            mask = mask.expand(N, self.heads, -1, -1)
+
+            sims = torch.masked_fill(sims, mask == 0, value=float("-inf"))
+
+
+
+
+
+
 
         attentions = torch.softmax(sims, dim=3)  # (N, q의 길이 L, k의 길이 L  :: 마지막차원을 정규화 )
 

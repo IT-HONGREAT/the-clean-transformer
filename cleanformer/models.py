@@ -123,6 +123,8 @@ class Decoder(torch.nn.Module):
     def __init__(self, hidden_size: int, heads: int, max_length: int):
         super().__init__()
         self.masked_multi_head_self_attention_layer = MultiHeadAttentionLayer(hidden_size, heads, max_length, masked=True)
+        self.multi_head_encoder_decoder_attention_layer = MultiHeadAttentionLayer(hidden_size, heads, max_length, masked=False)
+
 
     def forward(self, x:torch.Tensor, memory: torch.Tensor ):
         """
@@ -132,7 +134,9 @@ class Decoder(torch.nn.Module):
         """
 
         contexts = self.masked_multi_head_self_attention_layer.forward(q=x, k=x, v=x)
-        return contexts
+        alignments = self.multi_head_encoder_decoder_attention_layer.forward(q=contexts , k=memory , v=memory )
+
+        return alignments
     # TODO : ffn, residual connection
 
 class MultiHeadAttentionLayer(torch.nn.Module):

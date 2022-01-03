@@ -2,7 +2,7 @@ import torch.nn
 from pytorch_lightning import LightningModule
 from torch.nn import functional as F
 
-from cleanformer.tensors import subsequent_mask
+from cleanformer import tensors
 
 
 class Transformer(LightningModule):
@@ -22,7 +22,7 @@ class Transformer(LightningModule):
         self.decoder = Decoder(hidden_size, heads, max_length)
 
     def forward(self, src_ids: torch.LongTensor, tgt_ids: torch.Tensor,
-                src_key_padding_mask: torch.Tensor,tgt_key_padding_mask: torch.Tensor) -> torch.Tensor:
+                src_key_padding_mask: torch.LongTensor,tgt_key_padding_mask: torch.Tensor) -> torch.Tensor:
         # src_ids 는 임베딩 테이블!
         # 즉 임베딩 벡터를 불러오자
         """
@@ -35,8 +35,8 @@ class Transformer(LightningModule):
 
         #TODO: 나중에하기
 
-        memory = self.encoder.forward(src)  # (N,L,H) -> (N,L,H)정보만을 더해주기 때문에 차원은 그대로 유지된다
-        hidden = self.decoder.forward(tgt, memory) # (N,L,H) -> (N,L,H)
+        memory = self.encoder.forward(src, src_key_padding_mask)  # (N,L,H) -> (N,L,H)정보만을 더해주기 때문에 차원은 그대로 유지된다
+        hidden = self.decoder.forward(tgt, memory, tgt_key_padding_mask, src_key_padding_mask) # (N,L,H) -> (N,L,H)
 
         return hidden
 
@@ -110,10 +110,10 @@ class Encoder(torch.nn.Module):
 
         #TODO - ffn
 
-    def forward(self, x:torch.Tensor):
+    def forward(self, x:torch.Tensor, x_key_padding_mask:torch.LongTensor):
 
 
-        contexts = self.multi_head_self_attention_layer.forward(q=x, k=x, v=x) # 단어가 쓰인 문장에서 단어가 가지는 의미를 임베딩 벡터에 인코딩해준다
+        contexts = self.multi_head_self_attention_layer.forward(q=x, k=x, v=x, key_padding_mask=x_key_padding_mask) # 단어가 쓰인 문장에서 단어가 가지는 의미를 임베딩 벡터에 인코딩해준다
         # 맥락이반영된 벡터
         return contexts
 
@@ -126,7 +126,8 @@ class Decoder(torch.nn.Module):
         self.multi_head_encoder_decoder_attention_layer = MultiHeadAttentionLayer(hidden_size, heads, max_length, masked=False)
 
 
-    def forward(self, x:torch.Tensor, memory: torch.Tensor ):
+    def forward(self, x:torch.Tensor, memory: torch.Tensor, x_key_padding_mask: torch.LongTensor,
+                memory_key_padding_mask: torch.LongTensor):
         """
 
         memory: (N, L, H) - 인코더의 출력 ( 한국어 문장에 대한 기억)
@@ -157,15 +158,18 @@ class MultiHeadAttentionLayer(torch.nn.Module):
         self.linear_o = torch.nn.Linear(hidden_size,hidden_size)
 
         # 상수 텐서를 register_buffer ; 아래에 마스킹을 할때 텐서를 직접 생성하게 되면 연산이 느리고, cuda error가 발생.
-        self.register_buffer("subsequent_mask", subsequent_mask(max_length))
+        self.register_buffer("subsequent_mask", tensors.subsequent_mask(max_length))
 
 
-    def forward(self, q:torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def forward(self, q:torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                key_padding_mask:torch.Tensor) -> torch.Tensor:
 
         """
         q: (N,L,H)
         k: (N,L,H)
         v: (N,L,H)
+        key_padding_mask: (N,L)
+
         return => (N,L,H)
 
         """
@@ -190,20 +194,16 @@ class MultiHeadAttentionLayer(torch.nn.Module):
         # (N, L, heads, head_size) * (N, L, heads, head_size) -> (N, heads, L, L)
         sims = torch.einsum("nqhs,nkhs->nhqk", q, k)
 
+        # padding mask는 모든 어텐션 레이어에 적용
 
-        # TODO - masking(auto-regressive)
+        mask = key_padding_mask.reshape(N, 1, 1, self.max_length)\
+            .expand(-1, self.heads, self.max_length, -1)
 
-        if self.masked:
-            """
-            subsequent masking 이 되지않은 부분에 -inf
-            masked_fill
-            """
+        sims = torch.masked_fill(sims, mask == 0, value=float("-inf"))
 
-            # ( L, L) -> (1, 1, L, L) -> (N, heads, L, L)
-            mask = self.subsequent_mask.reshape(1, 1, self.max_length, self.max_length)
-            mask = mask.expand(N, self.heads, -1, -1)
+        mask = self.bulid_mask(key_padding_mask)
 
-            sims = torch.masked_fill(sims, mask == 0, value=float("-inf"))
+        sims = torch.masked_fill(sims, mask == 0, value=float("-inf"))
 
 
 
@@ -223,3 +223,27 @@ class MultiHeadAttentionLayer(torch.nn.Module):
         # 단순한 join이므로 변경할 필요없음
         contexts = self.linear_o(contexts)  # (N,L,H) -> (N,L,H)
         return contexts
+
+
+    def bulid_mask(self, key_padding_mask: torch.LongTensor) -> torch.LongTensor:
+        """
+        key_padding_mask (N,L)
+        """
+
+        N, _ = key_padding_mask.size()
+        mask = key_padding_mask.reshape(N, 1, 1, self.max_length) \
+            .expand(-1, self.heads, self.max_length, -1)
+
+        if self.masked:
+            """
+            subsequent masking 이 되지않은 부분에 -inf
+            masked_fill
+            """
+
+            # ( L, L) -> (1, 1, L, L) -> (N, heads, L, L)
+            subsequent_mask = self.subsequent_mask.reshape(1, 1, self.max_length, self.max_length)\
+            .expand(N, self.heads, -1, -1)
+
+            mask = torch.logical_and(mask, subsequent_mask).long()
+
+        return mask
